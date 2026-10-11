@@ -1621,8 +1621,9 @@
     // them).
     async function reportView() {
       const root = el('div', 'flex flex-col gap-4');
+      const noteBox = el('div');
       const host = el('div');
-      root.append(host);
+      root.append(noteBox, host);
       const st = makeStates(host, { errorTitle: "Couldn't load the report", loadingText: 'Loading the report' });
       st.setEmpty('No deposits yet', 'The report appears once the first deposit is recorded.');
       st.retry = load;

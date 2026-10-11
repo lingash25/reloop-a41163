@@ -1082,69 +1082,71 @@ app.patch('/api/members/:id', requireAdmin, async (req, res, next) => {
 // Neighborhood-level aggregates for the manager's Report tab. Voided
 // deposits count nowhere; by_type groups on the price-name snapshot
 // (deposit_items.label) so retired waste types still show their history.
+async function buildReport() {
+  const [dep, byType, misc] = await Promise.all([
+    // Waste, points and active members across all live deposits.
+    pool.query(`
+      SELECT COALESCE(SUM(i.weight_g), 0) AS waste_g,
+             COALESCE(SUM(i.points), 0) AS points_issued,
+             COUNT(DISTINCT d.member_id) AS members_active
+      FROM deposit_items i
+      JOIN deposits d ON d.id = i.deposit_id
+      WHERE d.voided = FALSE
+    `),
+    // Per waste type, grouped by the label snapshotted at record time.
+    pool.query(`
+      SELECT i.label, SUM(i.weight_g) AS weight_g, SUM(i.quantity) AS quantity, SUM(i.points) AS points,
+             COUNT(DISTINCT i.deposit_id) AS deposits
+      FROM deposit_items i
+      JOIN deposits d ON d.id = i.deposit_id
+      WHERE d.voided = FALSE
+      GROUP BY i.label
+      ORDER BY SUM(i.weight_g) DESC, SUM(i.points) DESC
+    `),
+    // Members, redemption and ledger-side figures in one pass.
+    pool.query(`
+      SELECT (SELECT COUNT(*) FROM members) AS members_total,
+             (SELECT COALESCE(SUM(points_balance), 0) FROM members) AS points_in_circulation,
+             (SELECT COALESCE(SUM(points_spent), 0) FROM redemptions WHERE status = 'picked_up') AS points_redeemed,
+             (SELECT COALESCE(SUM(points_spent), 0) FROM redemptions WHERE status = 'pending') AS points_pending
+    `),
+  ]);
+  const m = misc.rows[0];
+  return {
+    waste_g: parseInt(dep.rows[0].waste_g, 10),
+    points_issued: parseInt(dep.rows[0].points_issued, 10),
+    members_active: parseInt(dep.rows[0].members_active, 10),
+    members_total: parseInt(m.members_total, 10),
+    points_in_circulation: parseInt(m.points_in_circulation, 10),
+    points_redeemed: parseInt(m.points_redeemed, 10),
+    points_pending: parseInt(m.points_pending, 10),
+    by_type: byType.rows.map(r => ({
+      label: r.label,
+      weight_g: parseInt(r.weight_g, 10),
+      quantity: r.quantity === null ? null : parseInt(r.quantity, 10),
+      points: parseInt(r.points, 10),
+      deposits: parseInt(r.deposits, 10),
+    })),
+  };
+}
+
 app.get('/api/report', requireAdmin, async (req, res, next) => {
   try {
-    const [dep, byType, misc] = await Promise.all([
-      // Waste, points and active members across all live deposits.
-      pool.query(`
-        SELECT COALESCE(SUM(i.weight_g), 0) AS waste_g,
-               COALESCE(SUM(i.points), 0) AS points_issued,
-               COUNT(DISTINCT d.member_id) AS members_active
-        FROM deposit_items i
-        JOIN deposits d ON d.id = i.deposit_id
-        WHERE d.voided = FALSE
-      `),
-      // Per waste type, grouped by the label snapshotted at record time.
-      pool.query(`
-        SELECT i.label, SUM(i.weight_g) AS weight_g, SUM(i.quantity) AS quantity, SUM(i.points) AS points,
-               COUNT(DISTINCT i.deposit_id) AS deposits
-        FROM deposit_items i
-        JOIN deposits d ON d.id = i.deposit_id
-        WHERE d.voided = FALSE
-        GROUP BY i.label
-        ORDER BY SUM(i.weight_g) DESC, SUM(i.points) DESC
-      `),
-      // Members, redemption and ledger-side figures in one pass.
-      pool.query(`
-        SELECT (SELECT COUNT(*) FROM members) AS members_total,
-               (SELECT COALESCE(SUM(points_balance), 0) FROM members) AS points_in_circulation,
-               (SELECT COALESCE(SUM(points_spent), 0) FROM redemptions WHERE status = 'picked_up') AS points_redeemed,
-               (SELECT COALESCE(SUM(points_spent), 0) FROM redemptions WHERE status = 'pending') AS points_pending
-      `),
-    ]);
-    const m = misc.rows[0];
+    const report = await buildReport();
     if (req.query.format === 'csv') {
       // The manager's file of the report: the By waste type list as shown.
-      const rows = byType.rows.map(r => csvRow([
+      const rows = report.by_type.map(r => csvRow([
         r.label,
-        // weight_g comes back as a string, so test the parsed number: a
-        // per-item group sums to 0 and shows only its Pieces.
-        parseInt(r.weight_g, 10) ? kgCell(parseInt(r.weight_g, 10)) : '',
-        r.quantity === null ? '' : parseInt(r.quantity, 10),
-        parseInt(r.points, 10),
-        parseInt(r.deposits, 10),
+        // A per-item group sums to 0 grams and shows only its Pieces.
+        r.weight_g ? kgCell(r.weight_g) : '',
+        r.quantity === null ? '' : r.quantity,
+        r.points,
+        r.deposits,
       ]));
       return sendCsv(res, 'reloop-report-' + csvDate(new Date(), req.query.tz) + '.csv',
         ['Waste type', 'Weight (kg)', 'Pieces', 'Points', 'Deposits'], rows);
     }
-    res.json({
-      report: {
-        waste_g: parseInt(dep.rows[0].waste_g, 10),
-        points_issued: parseInt(dep.rows[0].points_issued, 10),
-        members_active: parseInt(dep.rows[0].members_active, 10),
-        members_total: parseInt(m.members_total, 10),
-        points_in_circulation: parseInt(m.points_in_circulation, 10),
-        points_redeemed: parseInt(m.points_redeemed, 10),
-        points_pending: parseInt(m.points_pending, 10),
-        by_type: byType.rows.map(r => ({
-          label: r.label,
-          weight_g: parseInt(r.weight_g, 10),
-          quantity: r.quantity === null ? null : parseInt(r.quantity, 10),
-          points: parseInt(r.points, 10),
-          deposits: parseInt(r.deposits, 10),
-        })),
-      },
-    });
+    res.json({ report });
   } catch (err) { next(err); }
 });
 
