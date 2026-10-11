@@ -279,6 +279,18 @@ async function migrate() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // The waste bank's weekly opening: one row (id 1). `days` are weekdays,
+  // 0 = Sunday … 6 = Saturday; times are wall-clock 'HH:MM'. Public: it is
+  // the notice on the waste bank's door, and it names nobody.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS collection_schedule (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      days SMALLINT[] NOT NULL,
+      open_time TEXT NOT NULL,
+      close_time TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
   for (const t of ['members', 'deposits', 'deposit_items', 'redemptions', 'point_transactions']) {
     await pool.query(`COMMENT ON TABLE ${t} IS 'staging:private'`);
   }
@@ -1216,6 +1228,113 @@ app.get('/api/neighbourhood', async (req, res, next) => {
           .map((r, i) => ({ rank: i + 1, name: r.name, weight_g: r.weight_g })),
       },
     });
+  } catch (err) { next(err); }
+});
+
+// ── Collection schedule ─────────────────────────────────────────────────────
+//
+// Managers set which weekdays the waste bank opens and one time window for
+// them; everyone (guests included) sees the next collection on Home. The
+// next one is worked out in the viewer's time zone (`?tz=`, IANA, from the
+// browser; a bad or missing zone falls back to UTC) as of `req.now`.
+
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function cleanZone(tz) {
+  if (!tz || typeof tz !== 'string' || tz.length > 64) return 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return tz;
+  } catch (err) {
+    if (!(err instanceof RangeError)) throw err;
+    return 'UTC';
+  }
+}
+
+function minutesOf(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
+// The next opening on or after `now` in zone `tz`: today counts until its
+// closing time. Returns the local date ('YYYY-MM-DD'), its weekday and the
+// window, or null when no day is set.
+function nextCollection(schedule, now, tz) {
+  if (!schedule || !schedule.days.length) return null;
+  const parts = {};
+  for (const p of new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now)) parts[p.type] = p.value;
+  const nowMin = Number(parts.hour) * 60 + Number(parts.minute);
+  const today = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day));
+  for (let d = 0; d <= 7; d++) {
+    const day = new Date(today + d * 86400000);
+    const weekday = day.getUTCDay();
+    if (!schedule.days.includes(weekday)) continue;
+    if (d === 0 && nowMin >= minutesOf(schedule.close_time)) continue;
+    return {
+      date: day.toISOString().slice(0, 10),
+      weekday: WEEKDAYS[weekday],
+      days_from_today: d,
+      open_time: schedule.open_time,
+      close_time: schedule.close_time,
+      open_now: d === 0 && nowMin >= minutesOf(schedule.open_time),
+    };
+  }
+  return null;
+}
+
+// A fixed schedule for `?demo=1` on a staging preview, never stored, so the
+// populated card can be seen before any manager has set one.
+const DEMO_SCHEDULE = { days: [3, 6], open_time: '08:00', close_time: '10:00' };
+
+async function loadSchedule() {
+  const { rows } = await pool.query(
+    `SELECT days, open_time, close_time FROM collection_schedule WHERE id = 1`);
+  if (!rows.length) return null;
+  return { days: rows[0].days.map(Number).sort((a, b) => a - b), open_time: rows[0].open_time, close_time: rows[0].close_time };
+}
+
+function scheduleJson(schedule, req, demo) {
+  const tz = cleanZone(req.query.tz);
+  return { schedule, next: nextCollection(schedule, req.now, tz), time_zone: tz, demo: !!demo };
+}
+
+app.get('/api/schedule', async (req, res, next) => {
+  try {
+    const demo = IS_STAGING && req.query.demo === '1';
+    res.json(scheduleJson(demo ? DEMO_SCHEDULE : await loadSchedule(), req, demo));
+  } catch (err) { next(err); }
+});
+
+app.put('/api/schedule', requireAdmin, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const days = Array.isArray(body.days) ? body.days : null;
+    if (!days || !days.length) throw new ApiError(400, 'days_required');
+    if (!days.every(d => Number.isInteger(d) && d >= 0 && d <= 6)) throw new ApiError(400, 'invalid_days');
+    const clean = [...new Set(days)];
+    const open = typeof body.open_time === 'string' ? body.open_time.trim() : '';
+    const close = typeof body.close_time === 'string' ? body.close_time.trim() : '';
+    if (!HHMM.test(open) || !HHMM.test(close)) throw new ApiError(400, 'invalid_time');
+    if (minutesOf(open) >= minutesOf(close)) throw new ApiError(400, 'close_before_open');
+    clean.sort((a, b) => a - b);
+    await pool.query(`
+      INSERT INTO collection_schedule (id, days, open_time, close_time, updated_at)
+      VALUES (1, $1, $2, $3, NOW())
+      ON CONFLICT (id) DO UPDATE SET days = EXCLUDED.days, open_time = EXCLUDED.open_time,
+        close_time = EXCLUDED.close_time, updated_at = NOW()
+    `, [clean, open, close]);
+    res.json(scheduleJson(await loadSchedule(), req, false));
+  } catch (err) { next(err); }
+});
+
+app.delete('/api/schedule', requireAdmin, async (req, res, next) => {
+  try {
+    await pool.query(`DELETE FROM collection_schedule WHERE id = 1`);
+    res.json(scheduleJson(null, req, false));
   } catch (err) { next(err); }
 });
 

@@ -131,7 +131,12 @@
     );
 
     async function api(path, opts) {
-      const res = await fetch(path, Object.assign({ headers: HEADERS }, opts || {}));
+      // A staging preview opened as of another moment tells the server
+      // that moment, so "next collection" matches what the page shows.
+      const headers = window.usernode && window.usernode.previewNow
+        ? Object.assign({ 'x-usernode-now': window.usernode.now().toISOString() }, HEADERS)
+        : HEADERS;
+      const res = await fetch(path, Object.assign({ headers: headers }, opts || {}));
       let data = null;
       try { data = await res.json(); } catch (_) {}
       if (!res.ok) {
@@ -278,6 +283,17 @@
       return new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
     }
     function displayName(m) { return (m && (m.display_name || m.username)) || 'Member'; }
+    const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    // Monday first, as on an Indonesian calendar.
+    const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
+    function viewerZone() {
+      try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) { return ''; }
+    }
+    function scheduleDays(days) {
+      const names = WEEK_ORDER.filter(d => days.includes(d)).map(d => DAY_NAMES[d]);
+      if (names.length === 7) return 'Every day';
+      return 'Every ' + (names.length > 1 ? names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1] : names[0]);
+    }
     const STATUS_LABEL = { pending: 'Waiting for pickup', picked_up: 'Picked up', cancelled: 'Cancelled' };
 
     function badge(text) {
@@ -479,6 +495,14 @@
       const card = el('section', 'card flex min-h-24 flex-col justify-center gap-1');
       root.append(card);
 
+      // Next collection — when to bring sorted waste. Everyone sees it,
+      // guests included: it is the notice on the waste bank's door.
+      const coll = el('section', 'flex flex-col gap-2');
+      coll.append(el('h2', 'section-label', 'Next collection'));
+      const collHost = el('div');
+      coll.append(collHost);
+      root.append(coll);
+
       // Price list link — everyone sees it, guests included, since prices are
       // public and it helps people decide to sort.
       const priceList = el('ul', 'list');
@@ -541,6 +565,46 @@
         card.append(el('p', 'text-small text-muted',
           s ? kg(s.total_weight_g) + ' kg recycled · ' + fmt(s.deposit_count) + (s.deposit_count === 1 ? ' deposit' : ' deposits') : 'Your deposits will show here.'));
       }
+
+      const cst = makeStates(collHost, {
+        errorTitle: "Couldn't load the collection schedule",
+        errorBody: 'The rest of Home still works. Check your connection and try again.',
+        loadingText: 'Loading the collection schedule',
+      });
+      if (state.isAdmin) {
+        const setBtn = el('button', 'btn-primary', 'Set the schedule');
+        setBtn.type = 'button';
+        setBtn.addEventListener('click', () => { state.adminTab = 'schedule'; go('admin'); });
+        cst.setEmpty('No collection day set yet', 'Set the days and times the waste bank opens so residents know when to come.', setBtn);
+      } else {
+        cst.setEmpty('No collection day set yet', 'The waste bank manager has not set the opening days yet. Check back later.');
+      }
+      cst.retry = loadSchedule;
+      async function loadSchedule() {
+        cst.show('loading');
+        try {
+          const demo = params.get('demo') === '1' ? '&demo=1' : '';
+          const d = await api('/api/schedule?tz=' + encodeURIComponent(viewerZone()) + demo);
+          if (!d.next) { cst.show('empty'); return; }
+          const n = d.next;
+          // n.date is the viewer's local date; read it back as UTC so it
+          // never shifts a day.
+          const dateLabel = new Date(n.date + 'T00:00:00Z').toLocaleDateString('en-US', { day: 'numeric', month: 'long', timeZone: 'UTC' });
+          const dayLabel = n.days_from_today === 0 ? 'Today' : n.days_from_today === 1 ? 'Tomorrow, ' + n.weekday : n.weekday;
+          const li = el('li', 'list-row items-start justify-between');
+          const left = el('div', 'min-w-0');
+          left.append(
+            el('p', 'text-heading', dayLabel + ', ' + dateLabel),
+            el('p', 'text-body tabular-nums', n.open_time + '–' + n.close_time),
+            el('p', 'text-small text-muted', scheduleDays(d.schedule.days) + (d.demo ? ' (staging demo schedule)' : ''))
+          );
+          li.append(left);
+          if (n.open_now) li.append(el('span', 'shrink-0 rounded-full bg-raised px-2 py-0.5 text-small text-accent', 'Open now'));
+          cst.listEl.replaceChildren(li);
+          cst.show('list');
+        } catch (e) { console.error(String(e && e.stack || e)); cst.show('error'); }
+      }
+      loadSchedule();
 
       // Recycled by the neighborhood — what everyone has put through the
       // waste bank together. Signed-in members only: like the points card,
@@ -911,6 +975,7 @@
       ['rewards', 'Rewards'],
       ['queue', 'Redemption queue'],
       ['report', 'Report'],
+      ['schedule', 'Schedule'],
     ];
 
     routes.admin = async function adminView() {
@@ -957,6 +1022,7 @@
           rewards: adminRewardsView,
           queue: adminQueueView,
           report: reportView,
+          schedule: adminScheduleView,
         }[state.adminTab];
         content.replaceChildren();
         Promise.resolve(view()).then(node => content.replaceChildren(node));
@@ -1673,6 +1739,92 @@
 
           st.listEl.replaceChildren(tiles, lines, types);
           st.show('list');
+        } catch (e) { console.error(String(e && e.stack || e)); st.show('error'); }
+      }
+
+      await load();
+      return root;
+    }
+
+    // Admin: the waste bank's weekly opening days and time window.
+    async function adminScheduleView() {
+      const root = el('div', 'flex flex-col gap-4');
+      const noteBox = el('div');
+      const host = el('div');
+      root.append(noteBox, host);
+      const st = makeStates(host, { errorTitle: "Couldn't load the schedule", loadingText: 'Loading the schedule' });
+      st.retry = load;
+
+      function drawForm(schedule) {
+        const form = el('form', 'flex flex-col gap-4');
+        form.append(el('p', 'px-1 text-body text-muted',
+          'Residents see the next collection on Home, worked out in their own time zone.'));
+        const dayBoxes = {};
+        const dayGroup = el('fieldset', 'flex flex-col');
+        dayGroup.append(el('legend', 'px-1 text-small font-medium text-muted', 'Open on'));
+        for (const d of WEEK_ORDER) {
+          const cb = checkbox(DAY_NAMES[d], schedule ? schedule.days.includes(d) : false);
+          dayBoxes[d] = cb.box;
+          dayGroup.append(cb.wrap);
+        }
+        const openIn = el('input', 'field'); openIn.type = 'time'; openIn.value = schedule ? schedule.open_time : '08:00';
+        const closeIn = el('input', 'field'); closeIn.type = 'time'; closeIn.value = schedule ? schedule.close_time : '10:00';
+        const times = el('div', 'flex gap-3');
+        const o = fieldRow('Opens', openIn); o.classList.add('flex-1');
+        const c = fieldRow('Closes', closeIn); c.classList.add('flex-1');
+        times.append(o, c);
+        const actions = el('div', 'flex flex-wrap gap-2');
+        const save = el('button', 'btn-primary', 'Save schedule');
+        save.type = 'submit';
+        actions.append(save);
+        if (schedule) {
+          const clear = el('button', 'btn-secondary', 'Clear schedule');
+          clear.type = 'button';
+          clear.addEventListener('click', async () => {
+            clear.disabled = true;
+            try {
+              await api('/api/schedule', { method: 'DELETE' });
+              noteBox.replaceChildren(banner('Schedule cleared. Home now says no collection day is set.'));
+              drawForm(null);
+            } catch (e) {
+              noteBox.replaceChildren(banner('Clearing failed. Try again.', true));
+            } finally { clear.disabled = false; }
+          });
+          actions.append(clear);
+        }
+        form.append(dayGroup, times, actions);
+        form.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const days = WEEK_ORDER.filter(d => dayBoxes[d].checked);
+          if (!days.length) { noteBox.replaceChildren(banner('Pick at least one day the waste bank opens.', true)); return; }
+          save.disabled = true;
+          try {
+            const d = await api('/api/schedule?tz=' + encodeURIComponent(viewerZone()), {
+              method: 'PUT',
+              body: JSON.stringify({ days, open_time: openIn.value, close_time: closeIn.value }),
+            });
+            noteBox.replaceChildren(banner('Schedule saved. ' + scheduleDays(d.schedule.days) + ', ' +
+              d.schedule.open_time + '–' + d.schedule.close_time + '.'));
+            drawForm(d.schedule);
+          } catch (err) {
+            noteBox.replaceChildren(banner(
+              err.code === 'close_before_open' ? 'The closing time must be after the opening time.' :
+              err.code === 'invalid_time' ? 'Enter an opening and a closing time.' :
+              err.code === 'days_required' ? 'Pick at least one day the waste bank opens.' :
+              err.code === 'manager_only' ? 'Only waste bank managers can change the schedule.' :
+              'Saving failed. Try again.', true));
+          } finally { save.disabled = false; }
+        });
+        st.listEl.className = 'flex flex-col gap-4';
+        st.listEl.replaceChildren(form);
+        st.show('list');
+      }
+
+      async function load() {
+        st.show('loading');
+        try {
+          const d = await api('/api/schedule?tz=' + encodeURIComponent(viewerZone()));
+          drawForm(d.schedule);
         } catch (e) { console.error(String(e && e.stack || e)); st.show('error'); }
       }
 

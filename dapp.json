@@ -41,6 +41,16 @@
       "expectText": "Profile"
     },
     {
+      "name": "Home shows the next collection section",
+      "path": "/",
+      "expectText": "Next collection"
+    },
+    {
+      "name": "Home shows the next collection time from a schedule",
+      "path": "/?demo=1",
+      "expectText": "08:00–10:00"
+    },
+    {
       "id": "resident-browse",
       "name": "Resident browse: home and rewards",
       "path": "/",
