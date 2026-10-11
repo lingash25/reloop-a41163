@@ -16,6 +16,11 @@
       "expectText": "Points"
     },
     {
+      "name": "Home shows the neighborhood totals and leaderboard",
+      "path": "/",
+      "expectText": "Recycled by the neighborhood"
+    },
+    {
       "name": "Rewards catalog renders with stock",
       "path": "/#/rewards",
       "expectText": "Staging demo reward"
@@ -24,6 +29,11 @@
       "name": "Deposits shows the honest empty state",
       "path": "/#/deposits",
       "expectText": "No deposits yet"
+    },
+    {
+      "name": "Prices list renders the seeded waste types",
+      "path": "/#/prices",
+      "expectText": "pts per kg"
     },
     {
       "name": "Profile renders",

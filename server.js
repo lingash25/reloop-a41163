@@ -230,6 +230,9 @@ async function migrate() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // Opt-out of the monthly leaderboard on Home (NULL or FALSE = shown).
+  // Kilograms still count in the neighborhood totals either way.
+  await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS leaderboard_opt_out BOOLEAN`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS deposits (
       id SERIAL PRIMARY KEY,
@@ -328,7 +331,7 @@ async function seedStaging() {
   const members = [
     [900001, 'staging-demo-manager', 'Staging Demo Manager', 'House 01 / RT 01', true, 0],
     [900002, 'staging-demo-user', 'Staging Demo User', 'House 12 / RT 03', false, 104],
-    [900003, 'staging-demo-neighbour', 'Staging Demo Neighbour', 'House 07 / RT 02', false, 124],
+    [900003, 'staging-demo-neighbour', 'Staging Demo Neighbour', 'House 07 / RT 02', false, 184],
   ];
   for (const [id, username, displayName, houseNo, isAdmin, balance] of members) {
     await pool.query(
@@ -345,6 +348,8 @@ async function seedStaging() {
     [900104, 900002, 80, 4, [[900002, 10000, 80]]],
     [900105, 900003, 69, 12, [[900001, 2500, 37], [900002, 4000, 32]]],
     [900106, 900003, 55, 5, [[900003, 5500, 55]]],
+    // A per-item deposit so staging shows a Pieces line (weight_g is 0 there).
+    [900108, 900003, 60, 7, [[900007, 0, 60, 4]]],
   ];
   for (const [id, memberId, total, daysAgo, items] of deposits) {
     const ins = await pool.query(
@@ -353,11 +358,12 @@ async function seedStaging() {
       [id, memberId, total, daysAgo]
     );
     if (!ins.rows.length) continue; // already seeded; skip items + ledger
-    for (const [wtId, weightG, points] of items) {
-      const label = wasteTypes.find(w => w[0] === wtId)[1];
+    for (const [wtId, weightG, points, quantity] of items) {
+      const found = wasteTypes.find(w => w[0] === wtId);
+      const label = found ? found[1] : 'Staging demo: Used clothes (per item)';
       await pool.query(
-        `INSERT INTO deposit_items (deposit_id, waste_type_id, label, weight_g, points) VALUES ($1, $2, $3, $4, $5)`,
-        [id, wtId, label, weightG, points]
+        `INSERT INTO deposit_items (deposit_id, waste_type_id, label, weight_g, quantity, points) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [id, wtId, label, weightG, quantity ?? null, points]
       );
     }
     await pool.query(
@@ -388,7 +394,7 @@ async function seedStaging() {
   }
   // One voided deposit so staging shows that voids are excluded from the
   // report: its +32/−32 ledger pair nets to zero, so the demo balance (104)
-  // and the report totals (29,300 g / 408 pts) are unchanged.
+  // and the report totals (29,300 g / 468 pts) are unchanged.
   const voidIns = await pool.query(
     `INSERT INTO deposits (id, member_id, recorded_by, total_points, voided, voided_at, created_at)
      VALUES (900107, 900002, 900001, 32, TRUE, NOW() - make_interval(days => 3), NOW() - make_interval(days => 3))
@@ -447,7 +453,7 @@ function cleanUnit(v) {
 
 function getMemberByUser(userId) {
   return pool.query(
-    `SELECT id, user_id, username, display_name, house_no, phone, is_admin, points_balance
+    `SELECT id, user_id, username, display_name, house_no, phone, is_admin, points_balance, leaderboard_opt_out
      FROM members WHERE user_id = $1`, [userId]
   ).then(r => r.rows[0] || null);
 }
@@ -504,6 +510,7 @@ function memberJson(m) {
     phone: m.phone,
     is_admin: m.is_admin,
     points_balance: m.points_balance,
+    leaderboard_opt_out: m.leaderboard_opt_out === true,
   };
 }
 
@@ -538,12 +545,14 @@ app.patch('/api/me', async (req, res, next) => {
     // left out keep their current value.
     await pool.query(`
       UPDATE members SET
-        display_name = $2, house_no = $3, phone = $4
+        display_name = $2, house_no = $3, phone = $4, leaderboard_opt_out = $5
       WHERE id = $1
     `, [m.id,
         'display_name' in req.body ? cleanText(req.body.display_name, 120) : m.display_name,
         'house_no' in req.body ? cleanText(req.body.house_no, 120) : m.house_no,
-        'phone' in req.body ? cleanText(req.body.phone, 40) : m.phone]);
+        'phone' in req.body ? cleanText(req.body.phone, 40) : m.phone,
+        // Boolean, never a "clear": set only when the body carries it.
+        'leaderboard_opt_out' in req.body ? req.body.leaderboard_opt_out === true : m.leaderboard_opt_out === true]);
     res.json({ member: memberJson(await getMemberByUser(req.user.id)) });
   } catch (err) { next(err); }
 });
@@ -719,6 +728,49 @@ app.post('/api/rewards/:id/redeem', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── CSV export (manager only) ───────────────────────────────────────────────
+//
+// Hand-rolled RFC 4180: strings are quoted only when they must be, inner
+// quotes are doubled, and names starting with =, +, -, @, tab or CR get a
+// leading apostrophe so a spreadsheet never runs them as formulas.
+
+function csvCell(v) {
+  if (v === null || v === undefined) return '';
+  let s = String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  if (/["\r\n,]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function csvRow(cells) { return cells.map(csvCell).join(','); }
+
+function sendCsv(res, filename, header, rows) {
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', 'attachment; filename="' + filename + '"');
+  res.set('Cache-Control', 'no-store');
+  // A BOM keeps Excel reading the file as UTF-8.
+  res.send('﻿' + [csvRow(header), ...rows].join('\r\n') + '\r\n');
+}
+
+// Grams are integer columns; the CSV shows kilograms with their exact
+// value (at most 3 decimals), display only — nothing is stored as a float.
+function kgCell(g) { return g / 1000; }
+
+// YYYY-MM-DD in the viewer's zone, so rows fall on the same day as on
+// screen and sort correctly in a spreadsheet. A bad or missing zone falls
+// back to UTC.
+function csvDate(date, tz) {
+  const opts = { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' };
+  const fmtUTC = () => new Intl.DateTimeFormat('en-CA', opts).format(date);
+  if (!tz || typeof tz !== 'string' || tz.length > 64) return fmtUTC();
+  try {
+    return new Intl.DateTimeFormat('en-CA', Object.assign({}, opts, { timeZone: tz })).format(date);
+  } catch (err) {
+    if (!(err instanceof RangeError)) throw err;
+    return fmtUTC();
+  }
+}
+
 // ── Deposits ────────────────────────────────────────────────────────────────
 
 async function fetchDeposits(where, params, limit) {
@@ -760,12 +812,17 @@ async function fetchDeposits(where, params, limit) {
 app.get('/api/deposits', async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 200);
+    const csv = req.query.format === 'csv';
     let where = null;
     const params = [];
     if (req.query.member_id || req.query.all === '1') {
       const me = req.user ? await getMemberByUser(req.user.id) : null;
       if (!me || !me.is_admin) throw new ApiError(403, 'manager_only');
       if (req.query.member_id) { where = 'd.member_id = $1'; params.push(intParamReq(req.query.member_id)); }
+    } else if (csv) {
+      // The CSV export is a manager tool: a resident (or a guest) asking
+      // for it is refused rather than silently given their own history.
+      throw new ApiError(403, 'manager_only');
     } else if (req.user) {
       const me = await getMemberByUser(req.user.id);
       where = 'd.member_id = $1';
@@ -776,6 +833,25 @@ app.get('/api/deposits', async (req, res, next) => {
       return res.json({ deposits: [] });
     }
     const deposits = await fetchDeposits(where, params, limit);
+    if (csv) {
+      const rows = [];
+      for (const d of deposits) {
+        for (const i of d.items) {
+          rows.push(csvRow([
+            csvDate(d.created_at, req.query.tz),
+            d.id,
+            d.member.display_name || d.member.username || 'Member',
+            i.label,
+            i.quantity == null ? kgCell(i.weight_g) : '',
+            i.quantity == null ? '' : i.quantity,
+            i.points,
+            d.voided ? 'Voided' : 'Recorded',
+          ]));
+        }
+      }
+      return sendCsv(res, 'reloop-deposits-' + csvDate(new Date(), req.query.tz) + '.csv',
+        ['Date', 'Deposit', 'Member', 'Waste type', 'Weight (kg)', 'Pieces', 'Points', 'Status'], rows);
+    }
     res.json({ deposits });
   } catch (err) { next(err); }
 });
@@ -1056,106 +1132,90 @@ async function buildReport() {
 
 app.get('/api/report', requireAdmin, async (req, res, next) => {
   try {
-    res.json({ report: await buildReport() });
-  } catch (err) { next(err); }
-});
-
-// ── CSV exports (admin) ─────────────────────────────────────────────────────
-
-// One CSV cell: quoted when needed, and a leading = + - @ (a spreadsheet
-// formula) is defused with an apostrophe, since names are members' input.
-function csvCell(v) {
-  if (v === null || v === undefined) return '';
-  let s = String(v);
-  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
-  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
-function csvLines(rows) {
-  return rows.map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
-}
-// Integer grams → kilograms as a plain number string (no float storage).
-function kgText(g) {
-  return (g / 1000).toFixed(3).replace(/\.?0+$/, '');
-}
-// The browser's IANA zone (?tz=), so dates match the screen; UTC otherwise.
-function csvZone(req) {
-  const tz = typeof req.query.tz === 'string' ? req.query.tz : '';
-  try {
-    if (tz) { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); return tz; }
-  } catch {}
-  return 'UTC';
-}
-function dateText(d, tz) {
-  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
-    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).formatToParts(d).map(x => [x.type, x.value]));
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
-}
-function sendCsv(res, name, now, tz, body) {
-  const stamp = dateText(now, tz).slice(0, 10);
-  res.set('Content-Type', 'text/csv; charset=utf-8');
-  res.set('Content-Disposition', `attachment; filename="${name}-${stamp}.csv"`);
-  res.set('Cache-Control', 'no-store');
-  // The BOM makes spreadsheet apps read member names as UTF-8.
-  res.send('﻿' + body);
-}
-
-// The Report screen as CSV: the summary figures, then the by-waste-type
-// rollup, each block with its own header row. Voided deposits count nowhere.
-app.get('/api/report.csv', requireAdmin, async (req, res, next) => {
-  try {
-    const r = await buildReport();
-    const tz = csvZone(req);
-    const summary = [
-      ['Measure', 'Value'],
-      ['Waste collected (kg)', kgText(r.waste_g)],
-      ['Points issued', r.points_issued],
-      ['Points redeemed', r.points_redeemed],
-      ['Members with deposits', r.members_active],
-      ['Members', r.members_total],
-      ['Points waiting for pickup', r.points_pending],
-      ['Points in circulation', r.points_in_circulation],
-    ];
-    const types = [['Waste type', 'Weight (kg)', 'Items', 'Points', 'Deposits']].concat(
-      r.by_type.map(t => [t.label, t.quantity !== null && !t.weight_g ? '' : kgText(t.weight_g), t.quantity === null ? '' : t.quantity, t.points, t.deposits])
-    );
-    sendCsv(res, 'reloop-report', req.now, tz, csvLines(summary) + '\r\n' + csvLines(types));
-  } catch (err) { next(err); }
-});
-
-// The manager's deposit history as CSV, one row per deposit line, with the
-// same ?member_id= filter as the Deposits screen. Unlike the screen (capped
-// at the latest 100) it carries the whole history. Voided deposits stay in,
-// marked in Status, exactly as the list shows them.
-app.get('/api/deposits.csv', requireAdmin, async (req, res, next) => {
-  try {
-    const params = [];
-    let where = '';
-    if (req.query.member_id) { where = 'WHERE d.member_id = $1'; params.push(intParamReq(req.query.member_id)); }
-    const { rows } = await pool.query(`
-      SELECT d.id, d.created_at, d.voided, m.display_name, m.username, m.house_no,
-             i.label, i.weight_g, i.quantity, i.points
-      FROM deposits d
-      JOIN members m ON m.id = d.member_id
-      JOIN deposit_items i ON i.deposit_id = d.id
-      ${where}
-      ORDER BY d.created_at DESC, d.id DESC, i.id
-    `, params);
-    const tz = csvZone(req);
-    const lines = [['Date', 'Deposit', 'Resident', 'House number', 'Waste type', 'Weight (kg)', 'Items', 'Points', 'Status']]
-      .concat(rows.map(r => [
-        dateText(r.created_at, tz),
-        r.id,
-        r.display_name || r.username,
-        r.house_no || '',
+    const report = await buildReport();
+    if (req.query.format === 'csv') {
+      // The manager's file of the report: the By waste type list as shown.
+      const rows = report.by_type.map(r => csvRow([
         r.label,
-        r.quantity === null ? kgText(r.weight_g) : '',
+        // A per-item group sums to 0 grams and shows only its Pieces.
+        r.weight_g ? kgCell(r.weight_g) : '',
         r.quantity === null ? '' : r.quantity,
         r.points,
-        r.voided ? 'Voided' : 'Recorded',
+        r.deposits,
       ]));
-    sendCsv(res, 'reloop-deposits', req.now, tz, csvLines(lines));
+      return sendCsv(res, 'reloop-report-' + csvDate(new Date(), req.query.tz) + '.csv',
+        ['Waste type', 'Weight (kg)', 'Pieces', 'Points', 'Deposits'], rows);
+    }
+    res.json({ report });
+  } catch (err) { next(err); }
+});
+
+// ── Neighborhood totals + monthly leaderboard (signed-in members) ──────────
+//
+// Home's "Recycled by the neighborhood" section. Aggregates only: no member
+// id, username, house number, phone or points balance ever leaves the server
+// here — the leaderboard carries a first name and kilograms, nothing else.
+// Voided deposits count nowhere and per-item lines (quantity set) carry no
+// kilograms, so both are filtered out of every figure.
+app.get('/api/neighbourhood', async (req, res, next) => {
+  try {
+    // The auth middleware lets guests through on GET, so the route checks
+    // this itself: totals need an account, like the points card.
+    if (!req.user) throw new ApiError(401, 'account_required');
+    // Month boundary from `req.now` (never SQL NOW()): a staging preview
+    // opened as of another moment must show that month.
+    const monthStart = "date_trunc('month', $1::timestamptz)";
+    const [tot, byType, board] = await Promise.all([
+      pool.query(`
+        SELECT COALESCE(SUM(i.weight_g) FILTER (WHERE d.created_at >= ${monthStart}), 0) AS month_g,
+               COALESCE(SUM(i.weight_g), 0) AS all_time_g,
+               ${monthStart} AS month_start
+        FROM deposit_items i JOIN deposits d ON d.id = i.deposit_id
+        WHERE d.voided = FALSE AND i.quantity IS NULL
+      `, [req.now]),
+      // Per waste type, all time, grouped on the label snapshotted at record
+      // time (matches /api/report).
+      pool.query(`
+        SELECT i.label, SUM(i.weight_g) AS weight_g
+        FROM deposit_items i JOIN deposits d ON d.id = i.deposit_id
+        WHERE d.voided = FALSE AND i.quantity IS NULL
+        GROUP BY i.label
+        HAVING SUM(i.weight_g) > 0
+        ORDER BY SUM(i.weight_g) DESC, i.label
+      `),
+      pool.query(`
+        SELECT SUM(i.weight_g) AS weight_g, m.display_name, m.username
+        FROM deposit_items i
+        JOIN deposits d ON d.id = i.deposit_id
+        JOIN members m ON m.id = d.member_id
+        WHERE d.voided = FALSE AND i.quantity IS NULL
+          AND d.created_at >= ${monthStart}
+          AND m.leaderboard_opt_out IS NOT TRUE
+        GROUP BY m.id, m.display_name, m.username
+        HAVING SUM(i.weight_g) > 0
+        ORDER BY SUM(i.weight_g) DESC
+        LIMIT 10
+      `, [req.now]),
+    ]);
+    // First name only: the first word of the display name, else of the
+    // username. Never a full name, house number or phone.
+    const firstName = (r) =>
+      ((cleanText(r.display_name, 120) || r.username).trim().split(/\s+/)[0] || '').slice(0, 40);
+    res.json({
+      neighbourhood: {
+        month_start: tot.rows[0].month_start,
+        month_g: parseInt(tot.rows[0].month_g, 10),
+        all_time_g: parseInt(tot.rows[0].all_time_g, 10),
+        by_type: byType.rows.map(r => ({
+          label: r.label,
+          weight_g: parseInt(r.weight_g, 10),
+        })),
+        leaderboard: board.rows
+          .map(r => ({ name: firstName(r), weight_g: parseInt(r.weight_g, 10) }))
+          .sort((a, b) => b.weight_g - a.weight_g || a.name.localeCompare(b.name))
+          .map((r, i) => ({ rank: i + 1, name: r.name, weight_g: r.weight_g })),
+      },
+    });
   } catch (err) { next(err); }
 });
 

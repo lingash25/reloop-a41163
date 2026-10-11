@@ -144,6 +144,51 @@
       return data;
     }
 
+    // Manager CSV export: fetched with the sign-in token in the header
+    // (never in the URL), then saved as a blob download.
+    async function downloadCsv(path, filename) {
+      const res = await fetch(path, { headers: HEADERS });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+
+    // A secondary "Download CSV" button for the manager screens. getPath
+    // is read at click time so it follows the current filter; failures
+    // land in noteHost as the usual error banner and never disturb the
+    // list on screen.
+    function csvButton(getPath, prefix, noteHost) {
+      const btn = el('button', 'btn-secondary self-start', 'Download CSV');
+      btn.type = 'button';
+      btn.addEventListener('click', async () => {
+        noteHost.replaceChildren();
+        btn.disabled = true;
+        btn.textContent = 'Preparing CSV…';
+        try {
+          const tz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || '');
+          const p = n => String(n).padStart(2, '0');
+          const today = new Date();
+          const stamp = today.getFullYear() + '-' + p(today.getMonth() + 1) + '-' + p(today.getDate());
+          const path = getPath();
+          const join = path.includes('?') ? '&' : '?';
+          await downloadCsv(path + join + 'format=csv&tz=' + tz, prefix + '-' + stamp + '.csv');
+        } catch (e) {
+          console.error(String(e && e.stack || e));
+          noteHost.replaceChildren(banner("Couldn't download the CSV. The list still works. Try again.", true));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Download CSV';
+        }
+      });
+      return btn;
+    }
+
     // ── Tiny DOM helpers ───────────────────────────────────────────────────
     // Everything renders through textContent — member and reward names are
     // other people's input and never become HTML.
@@ -241,35 +286,6 @@
     function banner(text, isError) {
       return el('div', 'rounded-lg border px-4 py-3 text-small ' +
         (isError ? 'border-danger/40 text-danger' : 'border-line bg-raised text-fg'), text);
-    }
-    // Manager CSV export: fetch with the token header (a plain link could
-    // not carry it), then hand the file to the browser as a download. The
-    // browser's time zone goes along so dates match the screen.
-    async function downloadCsv(path, button, noteBox) {
-      const label = button.textContent;
-      button.disabled = true;
-      button.textContent = 'Preparing CSV';
-      noteBox.replaceChildren();
-      try {
-        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-        const res = await fetch(path + (path.includes('?') ? '&' : '?') + 'tz=' + encodeURIComponent(tz), { headers: HEADERS });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const m = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
-        const url = URL.createObjectURL(await res.blob());
-        const a = el('a');
-        a.href = url;
-        a.download = m ? m[1] : 'reloop.csv';
-        document.body.append(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-      } catch (e) {
-        console.warn('CSV export failed', String(e));
-        noteBox.replaceChildren(banner("Couldn't prepare the CSV. Check your connection and try again.", true));
-      } finally {
-        button.disabled = false;
-        button.textContent = label;
-      }
     }
     function fieldRow(labelText, input) {
       const wrap = el('label', 'flex flex-col gap-1');
@@ -429,7 +445,9 @@
         .map(t => {
           const b = el('button', 'tab-btn');
           b.type = 'button';
-          if (t.id === current) b.setAttribute('aria-current', 'page');
+          // The read-only Prices screen is reached from Home and keeps Home
+          // highlighted in the tab bar.
+          if (t.id === (current === 'prices' ? 'home' : current)) b.setAttribute('aria-current', 'page');
           b.append(icon(t.icon, 'h-5 w-5'), el('span', '', t.label));
           b.addEventListener('click', () => { window.location.hash = '#/' + t.id; });
           return b;
@@ -461,6 +479,23 @@
       const card = el('section', 'card flex min-h-24 flex-col justify-center gap-1');
       root.append(card);
 
+      // Price list link — everyone sees it, guests included, since prices are
+      // public and it helps people decide to sort.
+      const priceList = el('ul', 'list');
+      const priceBtn = el('button', 'list-row w-full cursor-pointer justify-between text-left');
+      priceBtn.type = 'button';
+      const priceLeft = el('div', 'min-w-0');
+      priceLeft.append(
+        el('p', 'text-body font-medium', 'Price list'),
+        el('p', 'text-small text-muted', 'Points each waste type earns')
+      );
+      priceBtn.append(priceLeft, icon(ICONS.chevron, 'h-4 w-4 shrink-0 text-muted'));
+      priceBtn.addEventListener('click', () => go('prices'));
+      const priceLi = el('li');
+      priceLi.append(priceBtn);
+      priceList.append(priceLi);
+      root.append(priceList);
+
       // Recent deposits.
       const recent = el('section', 'flex flex-col gap-2');
       root.append(recent);
@@ -483,7 +518,6 @@
       });
       howCard.append(steps);
       how.append(howCard);
-      root.append(how);
 
       await loadMe(true);
       renderTabbar(currentRoute());
@@ -507,6 +541,85 @@
         card.append(el('p', 'text-small text-muted',
           s ? kg(s.total_weight_g) + ' kg recycled · ' + fmt(s.deposit_count) + (s.deposit_count === 1 ? ' deposit' : ' deposits') : 'Your deposits will show here.'));
       }
+
+      // Recycled by the neighborhood — what everyone has put through the
+      // waste bank together. Signed-in members only: like the points card,
+      // it needs an account. Aggregates only, so no other member's points
+      // balance is ever visible here.
+      if (!state.guest && state.member) {
+        const hood = el('section', 'flex flex-col gap-2');
+        hood.append(el('h2', 'section-label', 'Recycled by the neighborhood'));
+        const hoodHost = el('div');
+        hood.append(hoodHost);
+        root.append(hood);
+
+        const hst = makeStates(hoodHost, {
+          errorTitle: "Couldn't load the neighborhood totals",
+          errorBody: 'Your points and deposits above still work. Check your connection and try again.',
+          loadingText: 'Loading the neighborhood totals',
+        });
+        hst.setEmpty('Nothing recycled yet', 'The neighborhood totals appear once the first deposit is recorded.');
+        hst.retry = loadHood;
+        async function loadHood() {
+          hst.show('loading');
+          try {
+            const d = (await api('/api/neighbourhood')).neighbourhood;
+            if (d.all_time_g === 0) { hst.show('empty'); return; }
+            // Summary, not a row list: the host gives up its .list chrome
+            // (cards must not sit inside a .list) and carries tiles + lists.
+            hst.listEl.className = 'flex flex-col gap-4';
+
+            // UTC so the label matches the server's month boundary.
+            const monthLabel = new Date(d.month_start).toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+
+            const tiles = el('div', 'flex flex-wrap gap-2');
+            function tile(label, value) {
+              const c = el('div', 'card flex min-w-[45%] flex-1 flex-col gap-1');
+              c.append(el('p', 'text-small text-muted', label),
+                el('p', 'text-heading tabular-nums', value));
+              return c;
+            }
+            tiles.append(
+              tile(monthLabel, kg(d.month_g) + ' kg'),
+              tile('All time', kg(d.all_time_g) + ' kg')
+            );
+
+            const types = el('section', 'flex flex-col gap-2');
+            types.append(el('h2', 'section-label', 'By waste type, all time'));
+            const typeList = el('ul', 'list');
+            typeList.replaceChildren(...d.by_type.map(t => {
+              const li = el('li', 'list-row justify-between');
+              li.append(el('p', 'min-w-0 text-body', t.label),
+                el('span', 'shrink-0 tabular-nums text-small text-muted', kg(t.weight_g) + ' kg'));
+              return li;
+            }));
+            types.append(typeList);
+
+            const board = el('section', 'flex flex-col gap-2');
+            board.append(el('h2', 'section-label', 'Leaderboard, ' + monthLabel));
+            const boardList = el('ul', 'list');
+            if (d.leaderboard.length) {
+              boardList.replaceChildren(...d.leaderboard.map(row => {
+                const li = el('li', 'list-row');
+                li.append(
+                  el('span', 'flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-raised text-small font-medium text-muted', String(row.rank)),
+                  el('p', 'min-w-0 flex-1 text-body', row.name),
+                  el('span', 'shrink-0 tabular-nums text-small text-muted', kg(row.weight_g) + ' kg'));
+                return li;
+              }));
+            } else {
+              boardList.append(el('li', 'list-row text-small text-muted', 'No one on the leaderboard yet this month.'));
+            }
+            board.append(boardList, el('p', 'px-1 text-small text-muted',
+              'Ranked by kilograms deposited this month. First names only, never points. You can leave the leaderboard in Profile.'));
+
+            hst.listEl.replaceChildren(tiles, types, board);
+            hst.show('list');
+          } catch (e) { console.error(String(e && e.stack || e)); hst.show('error'); }
+        }
+        loadHood();
+      }
+      root.append(how);
 
       // Recent deposits list.
       recent.append(el('h2', 'section-label', 'Recent deposits'));
@@ -551,6 +664,41 @@
           const d = await api('/api/deposits');
           if (!d.deposits.length) { st.show('empty'); return; }
           st.listEl.replaceChildren(...d.deposits.map(x => depositDetails(x)));
+          st.show('list');
+        } catch (e) { console.error(String(e && e.stack || e)); st.show('error'); }
+      }
+      await load();
+      return root;
+    };
+
+    // ── Prices (read-only, public) ─────────────────────────────────────────
+    // What each waste type earns. Reads the same public endpoint the record
+    // form reads, without ?all=1 and without touching state.wasteTypes, so
+    // the admin cache stays untouched and admins see active types only too.
+    routes.prices = async function pricesView() {
+      const root = el('section', 'flex flex-col gap-4');
+      root.append(el('h1', 'text-title', 'Prices'));
+      root.append(el('p', 'text-body text-muted',
+        'Points the waste bank gives for each waste type. The waste bank manager sets these prices.'));
+      const host = el('div');
+      root.append(host);
+      const st = makeStates(host, { errorTitle: "Couldn't load prices", loadingText: 'Loading prices' });
+      st.setEmpty('No prices yet', "The waste bank manager hasn't set any prices yet. Check back soon.");
+      st.retry = load;
+      async function load() {
+        st.show('loading');
+        try {
+          const d = await api('/api/waste-types');
+          if (!d.waste_types.length) { st.show('empty'); return; }
+          st.listEl.replaceChildren(...d.waste_types.map(t => {
+            const li = el('li', 'list-row justify-between');
+            li.append(
+              el('p', 'min-w-0 text-body font-medium', t.name),
+              el('span', 'shrink-0 tabular-nums text-body',
+                fmt(t.points_per_kg) + (t.unit === 'item' ? ' pts per item' : ' pts per kg'))
+            );
+            return li;
+          }));
           st.show('list');
         } catch (e) { console.error(String(e && e.stack || e)); st.show('error'); }
       }
@@ -680,10 +828,14 @@
       const phoneIn = textField(); phoneIn.value = state.member.phone || '';
       phoneIn.maxLength = 40;
       phoneIn.placeholder = 'Optional';
+      const lb = checkbox('Show me on the monthly leaderboard', !state.member.leaderboard_opt_out);
       form.append(
         fieldRow('Display name', nameIn),
         fieldRow('House number', houseIn),
-        fieldRow('Phone', phoneIn)
+        fieldRow('Phone', phoneIn),
+        lb.wrap,
+        el('p', 'px-1 text-small text-muted',
+          'Only your first name and kilograms show there. Your points stay private either way.')
       );
       const save = el('button', 'btn-primary self-start', 'Save');
       save.type = 'submit';
@@ -694,7 +846,7 @@
         try {
           await api('/api/me', {
             method: 'PATCH',
-            body: JSON.stringify({ display_name: nameIn.value, house_no: houseIn.value, phone: phoneIn.value }),
+            body: JSON.stringify({ display_name: nameIn.value, house_no: houseIn.value, phone: phoneIn.value, leaderboard_opt_out: !lb.box.checked }),
           });
           note.replaceChildren(banner('Profile saved.'));
         } catch (_) {
@@ -1042,14 +1194,12 @@
       sel.value = state.memberFilter;
       sel.addEventListener('change', () => { state.memberFilter = sel.value; load(); });
       filterRow.append(sel);
-      const exportBtn = el('button', 'btn-secondary self-start', 'Download CSV');
-      exportBtn.type = 'button';
-      exportBtn.hidden = true;
-      exportBtn.addEventListener('click', () => downloadCsv(
-        '/api/deposits.csv' + (state.memberFilter ? '?member_id=' + encodeURIComponent(state.memberFilter) : ''),
-        exportBtn, noteBox));
+      const csvNote = el('div');
+      const csvBtn = csvButton(
+        () => state.memberFilter ? '/api/deposits?member_id=' + encodeURIComponent(state.memberFilter) : '/api/deposits?all=1',
+        'reloop-deposits', csvNote);
       const host = el('div');
-      root.append(noteBox, filterRow, exportBtn, host);
+      root.append(noteBox, filterRow, csvBtn, csvNote, host);
 
       const st = makeStates(host, { errorTitle: "Couldn't load deposits", loadingText: 'Loading deposits' });
       st.setEmpty('No deposits yet', 'Recorded deposits across the neighborhood will appear here.');
@@ -1057,14 +1207,15 @@
 
       async function load() {
         st.show('loading');
+        csvBtn.hidden = true;
+        csvNote.replaceChildren();
         try {
           const q = state.memberFilter ? '/api/deposits?member_id=' + encodeURIComponent(state.memberFilter) : '/api/deposits?all=1';
-          exportBtn.hidden = true;
           const d = await api(q);
           if (!d.deposits.length) { st.show('empty'); return; }
           st.listEl.replaceChildren(...d.deposits.map(x => depositDetails(x, { showMember: true, voidButton: voidDeposit })));
           st.show('list');
-          exportBtn.hidden = false;
+          csvBtn.hidden = false;
         } catch (e) { console.error(String(e && e.stack || e)); st.show('error'); }
       }
 
@@ -1517,12 +1668,10 @@
             return li;
           }));
           types.append(list);
+          const csvNote = el('div');
+          types.append(csvButton(() => '/api/report', 'reloop-report', csvNote), csvNote);
 
-          const exportBtn = el('button', 'btn-secondary self-start', 'Download CSV');
-          exportBtn.type = 'button';
-          exportBtn.addEventListener('click', () => downloadCsv('/api/report.csv', exportBtn, noteBox));
-
-          st.listEl.replaceChildren(exportBtn, tiles, lines, types);
+          st.listEl.replaceChildren(tiles, lines, types);
           st.show('list');
         } catch (e) { console.error(String(e && e.stack || e)); st.show('error'); }
       }

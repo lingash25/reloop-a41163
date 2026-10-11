@@ -11,13 +11,19 @@ prices, manage the roster and the reward catalog, and hand out redemptions.
 **Residents** (everyone signed in through Homeroom):
 
 - **Home** — current points balance, how much has been recycled so far, the
-  three most recent deposits, and how the loop works.
+  three most recent deposits, what the **neighborhood** has recycled together
+  (kilograms this month and all time, by waste type) and the **monthly
+  leaderboard** (kilograms only, first names only), plus how the loop works.
 - **Deposits** — deposit history with the full per-waste-type breakdown.
+- **Price list** — opened from Home: every waste type the waste bank accepts
+  and its points per kilogram (or per item), read-only and always current.
 - **Rewards** — the catalog with stock; redeem points and track the pickup
   (Waiting for pickup / Picked up / Cancelled — cancelled redemptions refund
   the points automatically).
-- **Profile** — display name, house number and optional phone; plus the
-  one-time **waste bank manager setup** (below).
+- **Profile** — display name, house number and optional phone; the
+  **leaderboard opt-out** (untick to leave the monthly leaderboard; your
+  kilograms still count in the totals); plus the one-time **waste bank
+  manager setup** (below).
 
 **Waste bank managers** (the **Admin** tab):
 
@@ -65,8 +71,13 @@ in the app. After that, managers manage each other from the Members screen.
 ## Out of scope for the MVP
 
 Multiple waste banks per app instance, Rupiah/cash payouts, photo proof and
-QR check-in, pickup scheduling, notifications, exports, resident
+QR check-in, pickup scheduling, notifications, resident
 self-reporting of deposits, and offline mode.
+
+Waste bank managers can download the deposits list and the Report tab as
+CSV files (a "Download CSV" button on each), for RT/RW reporting and
+spreadsheets; the export follows the member filter in use and is
+manager-only.
 
 ## Running it
 
